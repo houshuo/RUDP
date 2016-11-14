@@ -140,6 +140,8 @@ namespace MobaNet
 
         void ProcessSendQueue(float deltaTime)
         {
+            FlushAck();
+
             if (_state == RUDP_STATE.SYN_SEND)
             {
                 _stateTimer += deltaTime;
@@ -160,8 +162,6 @@ namespace MobaNet
             }
             else if (_state == RUDP_STATE.ESTABLISED)
             {
-                FlushAck();
-
                 //Put available packages to waiting dict
                 int readyToSendNum = 0;
 
@@ -352,21 +352,25 @@ namespace MobaNet
 
         private void FlushAck()
         {
-            //if ack list is empty, return
-
-            //Calculate una
-            _una = _nextRecvSeqNo;
-            while(true)
+            if(_state == RUDP_STATE.ESTABLISED)
             {
-                if(_recvQueue.ContainsKey(_una + 1))
+                //Calculate una
+                _una = _nextRecvSeqNo;
+                while (true)
                 {
-                    _una++;
-                }
-                else
-                {
-                    break;
+                    if (_recvQueue.ContainsKey(_una + 1))
+                    {
+                        _una++;
+                    }
+                    else
+                    {
+                        break;
+                    }
                 }
             }
+
+            if (_sendAckList.Count == 0)
+                return;
 
             //delete ack < _una
             for(int i = _sendAckList.Count - 1; i >= 0; i--)
@@ -385,7 +389,7 @@ namespace MobaNet
             bw.Write((byte)0);//7
             int lastRow = 0;
 
-            //一个ACK包最多承载255个ack
+            //a ack package could contain 255 ack commands at most
             for (int i = 0; i < _sendAckList.Count; i++)
             {
                 byte[] AckSeqBytes = BitConverter.GetBytes(_sendAckList[i]);
@@ -407,9 +411,9 @@ namespace MobaNet
                     bw.Write(_una);
                     bw.Write((byte)0);
                 }
-
-                bw.Close();
             }
+            bw.Close();
+            _sendAckList.Clear();
         }
 
         private void SendSYN(byte[] cookie)
