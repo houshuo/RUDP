@@ -11,11 +11,9 @@ namespace MobaNet
     public class SendingPackage
     {
         public byte[] Content;
-        public bool IsWaitingAck;
         public UInt32 SendingSequenceNo;
         public DateTime LastSendTimestamp;
         public DateTime FirstSendTimestamp;
-        public bool IsSending = false;
         public int fastack = 0;
     }
 
@@ -36,7 +34,8 @@ namespace MobaNet
         public bool reverseByte = true;
 
         public ushort MaxWaitingSendLength = 100;
-        private Queue<SendingPackage> _sendQueue;
+        private Queue<SendingPackage> _sendQueue;//all input waiting here
+        private Queue<byte[]> _sendBuffer;//data in stream
         private List<SendingPackage> _waitAckList;
 
         private List<UInt32> _sendAckList;
@@ -48,7 +47,8 @@ namespace MobaNet
 
         private UInt32 _currentSnedSeq;
 
-        private const ushort DataFrameHeaderLength = 104/8;
+        private const ushort DataFrameHeaderLength = 72 / 8;
+        private const ushort PublicFrameHeaderLength = 48 / 8;
 
         private List<RecvingPackage> _assmblingPackages;
 
@@ -79,6 +79,7 @@ namespace MobaNet
         public RUDP()
         {
             _sendQueue = new Queue<SendingPackage>();
+            _sendBuffer = new Queue<byte[]>();
             _waitAckList = new List<SendingPackage>();
 
             _sendAckList = new List<UInt32>();
@@ -91,6 +92,7 @@ namespace MobaNet
         public void RUDPReset()
         {
             _sendQueue.Clear();
+            _sendBuffer.Clear();
             _waitAckList.Clear();
 
             _sendAckList.Clear();
@@ -138,10 +140,9 @@ namespace MobaNet
             ProcessSendQueue(deltaTime);
         }
 
+        byte[] SendStreamBuffer = new byte[MTU]; // for final frame construction 
         void ProcessSendQueue(float deltaTime)
         {
-            FlushAck();
-
             if (_state == RUDP_STATE.SYN_SEND)
             {
                 _stateTimer += deltaTime;
@@ -169,13 +170,10 @@ namespace MobaNet
                 for (int i = 0; i < readyToSendNum; i++)
                 {
                     SendingPackage package = _sendQueue.Dequeue();
-                    Array.Copy(BitConverter.GetBytes(_una), 0, package.Content, 9, 4);
-                    bool success = Send(package.Content);
+                    _sendBuffer.Enqueue(package.Content);
                     package.LastSendTimestamp = DateTime.Now;
                     package.FirstSendTimestamp = DateTime.Now;
                     _waitAckList.Add(package);
-                    if (!success)
-                        return;
                 }
 
                 //Re-send un-acked packages
@@ -191,15 +189,30 @@ namespace MobaNet
 
                     if ((DateTime.Now - package.LastSendTimestamp).Milliseconds > RetransmissionInterval || package.fastack >= 2)
                     {
-                        Array.Copy(BitConverter.GetBytes(_una), 0, package.Content, 9, 4);
-                        if (!Send(package.Content))
-                            return;
+                        _sendBuffer.Enqueue(package.Content);
                         package.LastSendTimestamp = DateTime.Now;
                         package.fastack = 0;
                     }
                 }
             }
             MobaNetworkManager.Instance.waitingSendNum = _sendQueue.Count + _waitAckList.Count;
+
+            int currentPos = PublicFrameHeaderLength;
+            //actually send
+            while(_sendBuffer.Count > 0)
+            {
+                byte[] nextSendContent = _sendBuffer.Dequeue();
+                if(currentPos + nextSendContent.Length > MTU)
+                {
+                    Send(SendStreamBuffer, currentPos);
+                    currentPos = PublicFrameHeaderLength;
+                }
+                Array.Copy(nextSendContent, 0, SendStreamBuffer, currentPos, nextSendContent.Length);
+            }
+            if(currentPos > PublicFrameHeaderLength)
+            {
+                Send(SendStreamBuffer, currentPos);
+            }
         }
 
         //DateTime lastTime;
@@ -207,8 +220,8 @@ namespace MobaNet
         {    
             MemoryStream msgStream = new MemoryStream(rawData);
             BinaryReader reader = new BinaryReader(msgStream);
+            //CRC
             byte[] checksumBytes = reader.ReadBytes(2);
-
             if (BitConverter.IsLittleEndian)
                 Array.Reverse(checksumBytes);
             UInt16 checksum = BitConverter.ToUInt16(checksumBytes, 0);
@@ -218,49 +231,52 @@ namespace MobaNet
                 Debug.LogWarning("Checksum Failed!!!!!!");
                 return;
             }
-            //Get controll bits
-            byte control = reader.ReadByte();
-            if (control == (byte)4)
+
+            //UNA
+            byte[] unaBytes = reader.ReadBytes(4);
+            if (BitConverter.IsLittleEndian)
+                Array.Reverse(unaBytes);
+            UInt32 coUna = BitConverter.ToUInt32(unaBytes, 0);
+
+            uint maxAckSeq = 0;
+
+            while(len > 0)
             {
-                if (_state != RUDP_STATE.ESTABLISED)
-                    return;
-                //this is a data frame
-                byte[] seqDataBytes = reader.ReadBytes(4);
+                //len
+                byte[] lenBytes = reader.ReadBytes(2);
                 if (BitConverter.IsLittleEndian)
-                    Array.Reverse(seqDataBytes);
-                UInt32 seqData = BitConverter.ToUInt32(seqDataBytes, 0);
-                byte[] maxPieceBytes = reader.ReadBytes(2);
-                if (BitConverter.IsLittleEndian)
-                    Array.Reverse(maxPieceBytes);
-                ushort maxPiece = BitConverter.ToUInt16(maxPieceBytes, 0);
-                byte[] unaBytes = reader.ReadBytes(4);
-                if (BitConverter.IsLittleEndian)
-                    Array.Reverse(unaBytes);
-                uint coUna = BitConverter.ToUInt32(unaBytes, 0);
-                byte[] data = reader.ReadBytes(len - DataFrameHeaderLength);                   
-                if (!_recvQueue.ContainsKey(seqData) && seqData >= _nextRecvSeqNo)
+                    Array.Reverse(lenBytes);
+                ushort currentLen = BitConverter.ToUInt16(lenBytes, 0);
+                len -= currentLen;
+
+                //Get controll bits
+                byte control = reader.ReadByte();
+                if (control == (byte)4)
                 {
-                    //replace dummy packages
-                    RecvingPackage recvPackage = new RecvingPackage();
-                    recvPackage.Data = data;
-                    recvPackage.MaxPiece = maxPiece;
-                    recvPackage.RecvingSequenceNo = seqData;
-                    _recvQueue.Add(seqData, recvPackage);
+                    if (_state != RUDP_STATE.ESTABLISED)
+                        return;
+                    //this is a data frame
+                    byte[] seqDataBytes = reader.ReadBytes(4);
+                    if (BitConverter.IsLittleEndian)
+                        Array.Reverse(seqDataBytes);
+                    UInt32 seqData = BitConverter.ToUInt32(seqDataBytes, 0);
+                    byte[] maxPieceBytes = reader.ReadBytes(2);
+                    if (BitConverter.IsLittleEndian)
+                        Array.Reverse(maxPieceBytes);
+                    ushort maxPiece = BitConverter.ToUInt16(maxPieceBytes, 0);
+                    byte[] data = reader.ReadBytes(currentLen - DataFrameHeaderLength);
+                    if (!_recvQueue.ContainsKey(seqData) && seqData >= _nextRecvSeqNo)
+                    {
+                        //replace dummy packages
+                        RecvingPackage recvPackage = new RecvingPackage();
+                        recvPackage.Data = data;
+                        recvPackage.MaxPiece = maxPiece;
+                        recvPackage.RecvingSequenceNo = seqData;
+                        _recvQueue.Add(seqData, recvPackage);
+                    }
+                    SendAck(seqData);
                 }
-                AppendAck(seqData);
-
-                ProcessUna(coUna);
-            }
-            else if(control == (byte)3) //ACK, FIN+ACK
-            {
-                //this is a ack frame
-                byte[] unaBytes = reader.ReadBytes(4);
-                if (BitConverter.IsLittleEndian)
-                    Array.Reverse(unaBytes);
-                UInt32 coUna = BitConverter.ToUInt32(unaBytes, 0);
-                int ackNum = reader.ReadByte();
-
-                for(int i = 0; i < ackNum; i++)
+                else if (control == (byte)3) //ACK, FIN+ACK
                 {
                     byte[] seqDataBytes = reader.ReadBytes(4);
                     if (BitConverter.IsLittleEndian)
@@ -282,12 +298,9 @@ namespace MobaNet
                             MobaNetworkManager.Instance.ping += newPing;
                             _waitAckList.Remove(sendPackage);
 
-                            for (int j = 0; j <= _waitAckList.Count; j++)
+                            if(maxAckSeq < seqData)
                             {
-                                if (_waitAckList[j].SendingSequenceNo < seqData)
-                                {
-                                    _waitAckList[j].fastack++;
-                                }
+                                maxAckSeq = seqData;
                             }
                         }
                     }
@@ -297,62 +310,36 @@ namespace MobaNet
                             RUDPReset();
                     }
                 }
-
-                if(_state == RUDP_STATE.ESTABLISED)
+                else if (control == (byte)2)//SYN+ACK
                 {
-                    ProcessUna(coUna);
+                    byte[] seqDataBytes = reader.ReadBytes(4);
+                    if (BitConverter.IsLittleEndian)
+                        Array.Reverse(seqDataBytes);
+                    UInt32 seqData = BitConverter.ToUInt32(seqDataBytes, 0);
+                    SendAck(seqData);
+                    _state = RUDP_STATE.ESTABLISED;
+                    //lastTime = DateTime.Now;
+                    _nextRecvSeqNo = 1;
+                    _lastRecvSeqNo = UInt32.MaxValue;
                 }
-            } 
-            else if(control == (byte) 2)//SYN+ACK
-            {
-                byte[] seqDataBytes = reader.ReadBytes(4);
-                if (BitConverter.IsLittleEndian)
-                    Array.Reverse(seqDataBytes);
-                UInt32 seqData = BitConverter.ToUInt32(seqDataBytes, 0);
-                AppendAck(seqData);
-                _state = RUDP_STATE.ESTABLISED;
-                //lastTime = DateTime.Now;
-                _nextRecvSeqNo = 1;
-                _lastRecvSeqNo = UInt32.MaxValue;
-            }
-            else if(control == (byte) 6)//FIN
-            {
-                byte[] seqDataBytes = reader.ReadBytes(4);
-                if (BitConverter.IsLittleEndian)
-                    Array.Reverse(seqDataBytes);
-                _lastRecvSeqNo = BitConverter.ToUInt32(seqDataBytes, 0);
-            }
-            else if(control == (byte) 5)//RST
-            {
-                OnRUDPConnectionDisconnect();
-            }
-            else
-            {
-                Debug.LogError("Receive Illegal Package");
-            }
-        }
-
-        void ProcessUna(uint coUna)
-        {
-            for (int i = _waitAckList.Count - 1; i >= 0; i--)
-            {
-                if (_waitAckList[i].SendingSequenceNo <= coUna)
+                else if (control == (byte)6)//FIN
                 {
-                    _waitAckList.RemoveAt(i);
+                    byte[] seqDataBytes = reader.ReadBytes(4);
+                    if (BitConverter.IsLittleEndian)
+                        Array.Reverse(seqDataBytes);
+                    _lastRecvSeqNo = BitConverter.ToUInt32(seqDataBytes, 0);
+                }
+                else if (control == (byte)5)//RST
+                {
+                    OnRUDPConnectionDisconnect();
+                }
+                else
+                {
+                    Debug.LogError("Receive Illegal Package");
                 }
             }
-        }
 
-        void AppendAck(UInt32 seqNo)
-        {
-            _sendAckList.Add(seqNo);
-        }
-
-        byte[] AckFrame = new byte[MTU];
-
-        private void FlushAck()
-        {
-            if(_state == RUDP_STATE.ESTABLISED)
+            if (_state == RUDP_STATE.ESTABLISED)
             {
                 //Calculate una
                 _una = _nextRecvSeqNo;
@@ -367,53 +354,46 @@ namespace MobaNet
                         break;
                     }
                 }
-            }
 
-            if (_sendAckList.Count == 0)
-                return;
-
-            //delete ack < _una
-            for(int i = _sendAckList.Count - 1; i >= 0; i--)
-            {
-                if(_sendAckList[i] <= _una)
+                //fastack
+                for (int i = 0; i <= _waitAckList.Count; i++)
                 {
-                    _sendAckList.RemoveAt(i);
+                    if (_waitAckList[i].SendingSequenceNo < maxAckSeq)
+                    {
+                        _waitAckList[i].fastack++;
+                    }
+                }
+
+                //process correspondance's una
+                ProcessUna(coUna);
+            }
+        }
+
+        void ProcessUna(uint coUna)
+        {
+            for (int i = _waitAckList.Count - 1; i >= 0; i--)
+            {
+                if (_waitAckList[i].SendingSequenceNo <= coUna)
+                {
+                    _waitAckList.RemoveAt(i);
                 }
             }
+        }
 
-            MemoryStream ms = new MemoryStream(AckFrame);
+        void SendAck(UInt32 seqNo)
+        {
+            byte[] ackFrame = new byte[7];
+            MemoryStream ms = new MemoryStream(ackFrame);
             BinaryWriter bw = new BinaryWriter(ms);
-            bw.Write((ushort)0);//0
-            bw.Write((byte)3);//2
-            bw.Write(_una);//3
-            bw.Write((byte)0);//7
-            int lastRow = 0;
 
-            //a ack package could contain 255 ack commands at most
-            for (int i = 0; i < _sendAckList.Count; i++)
-            {
-                byte[] AckSeqBytes = BitConverter.GetBytes(_sendAckList[i]);
-                if (BitConverter.IsLittleEndian)
-                    Array.Reverse(AckSeqBytes);
-                bw.Write(AckSeqBytes); 
-                if((i - lastRow) == 255 || i == _sendAckList.Count - 1)
-                {
-                    bw.Close();
-                    AckFrame[7] = (byte)(i - lastRow);
-                    lastRow = i;
-                    if (!Send(AckFrame))
-                        break;
+            bw.Write((ushort)7);//len 0
+            bw.Write((byte)3); // control 2
+            bw.Write(seqNo); //seqNo 3
 
-                    ms = new MemoryStream(AckFrame);
-                    bw = new BinaryWriter(ms);
-                    bw.Write((ushort)0);
-                    bw.Write((byte)3);
-                    bw.Write(_una);
-                    bw.Write((byte)0);
-                }
-            }
             bw.Close();
-            _sendAckList.Clear();
+            ms.Flush();
+
+            _sendBuffer.Enqueue(ackFrame);
         }
 
         private void SendSYN(byte[] cookie)
@@ -422,14 +402,14 @@ namespace MobaNet
             byte[] frame = new byte[3 + cookie.Length];
             MemoryStream ms = new MemoryStream(frame);
             BinaryWriter bw = new BinaryWriter(ms);
-            bw.Write((ushort)0);
-            bw.Write((byte)1);
+            bw.Write((ushort)(3 + cookie.Length));//len 0
+            bw.Write((byte)1);//control 2
 
-            bw.Write(cookie);
+            bw.Write(cookie);//cookie 3
             bw.Close();
 
             //Debug.Log("Send SYN: ");
-            Send(frame);
+            _sendBuffer.Enqueue(frame);
         }
 
         private void SendFINACK()
@@ -437,17 +417,17 @@ namespace MobaNet
             byte[] frame = new byte[7];
             MemoryStream ms = new MemoryStream(frame);
             BinaryWriter bw = new BinaryWriter(ms);
-            bw.Write((ushort)0);
-            bw.Write((byte)7);
+            bw.Write((ushort)7);//len 0
+            bw.Write((byte)7);//control 2
             byte[] AckSeqBytes = BitConverter.GetBytes(_currentSnedSeq);
             if (BitConverter.IsLittleEndian)
                 Array.Reverse(AckSeqBytes);
-            bw.Write(AckSeqBytes);
+            bw.Write(AckSeqBytes);//seqNo 3
             
             bw.Close();
 
             //Debug.Log("Send FINACK");
-            Send(frame);
+            _sendBuffer.Enqueue(frame);
         }
 
         #region IsConnected
@@ -571,41 +551,38 @@ namespace MobaNet
         {
             //Capsule New Data
             List<SendingPackage> packages = Capsule(data);
-            foreach (SendingPackage package in packages)
-                _sendQueue.Enqueue(package);
+            for (int i = 0; i < packages.Count; i++)
+                _sendQueue.Enqueue(packages[i]);
         }
 
         private List<SendingPackage> Capsule(byte[] data)
         {
             List<SendingPackage> ret = new List<SendingPackage>();
-            int frameNum = (data.Length + (MTU - DataFrameHeaderLength) - 1) / (MTU - DataFrameHeaderLength);
+            int frameNum = (data.Length + (MTU - DataFrameHeaderLength - PublicFrameHeaderLength) - 1) / (MTU - DataFrameHeaderLength - PublicFrameHeaderLength);
             ushort currentPosition = 0;
             for (int i = 0; i < frameNum; i++)
             {
-                ushort dataLength = (ushort)Math.Min(MTU - DataFrameHeaderLength, data.Length - currentPosition);
+                ushort dataLength = (ushort)Math.Min(MTU - DataFrameHeaderLength - PublicFrameHeaderLength, data.Length - currentPosition);
                 byte[] frame = new byte[dataLength + DataFrameHeaderLength];
                 MemoryStream ms = new MemoryStream(frame);
                 BinaryWriter bw = new BinaryWriter(ms);
-                bw.Write(BitConverter.GetBytes((ushort)0));//0
-                bw.Write((byte)4);//2
+                bw.Write(BitConverter.GetBytes((ushort)0));//0 len
+                bw.Write((byte)4);//2 control
                 byte[] currentSendSeqBytes = BitConverter.GetBytes(_currentSnedSeq);
                 if (BitConverter.IsLittleEndian)
                     Array.Reverse(currentSendSeqBytes);
-                bw.Write(currentSendSeqBytes);//3
+                bw.Write(currentSendSeqBytes);//3 seqNo
                 byte[] maxPieceBytes = BitConverter.GetBytes((ushort)frameNum);
                 if (BitConverter.IsLittleEndian)
                     Array.Reverse(maxPieceBytes);
-                bw.Write(maxPieceBytes);//7
-                bw.Write((uint)0);//9
-                bw.Write(data, currentPosition, dataLength);//13
+                bw.Write(maxPieceBytes);//7 max piece
+                bw.Write(data, currentPosition, dataLength);//9 data
                 bw.Close();
                 SendingPackage package = new SendingPackage();
 
-                
-
                 package.Content = frame;
-                package.IsWaitingAck = true;
                 package.SendingSequenceNo = _currentSnedSeq;
+                package.fastack = 0;
                 _currentSnedSeq++;
                 currentPosition += dataLength;
                 ret.Add(package);
@@ -620,9 +597,14 @@ namespace MobaNet
 
         }
 
-        protected virtual bool Send(byte[] data)
+        protected virtual bool Send(byte[] data, int len)
         {
-            UInt16 checksum = CRCCheck.crc16(data, 2, data.Length);
+            byte[] unaBytes = BitConverter.GetBytes(_una);
+            if (BitConverter.IsLittleEndian)
+                Array.Reverse(unaBytes);
+            Array.Copy(unaBytes, 0, data, 2, 4);
+
+            UInt16 checksum = CRCCheck.crc16(data, 2, len);
             byte[] checksumBytes = BitConverter.GetBytes(checksum);
             if (BitConverter.IsLittleEndian)
                 Array.Reverse(checksumBytes);
@@ -659,16 +641,16 @@ namespace MobaNet
         HashSet<string> _socketSendErrorSet = new HashSet<string>();
         HashSet<string> _socketRecvErrorSet = new HashSet<string>();
 
-        protected override bool Send(byte[] f_data)
+        protected override bool Send(byte[] f_data, int len)
         {
-            base.Send(f_data);
+            base.Send(f_data, len);
             if (m_socket == null)
                 return false;
             try
             {
                 for (int i = 0; i < MultiSend; i++)
                 {
-                    m_socket.Send(f_data);
+                    m_socket.Send(f_data, len, SocketFlags.None);
                 }
             }
             catch(SocketException e)
