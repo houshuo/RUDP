@@ -38,9 +38,9 @@ namespace MobaNet
         private Queue<byte[]> _sendBuffer;//data in stream
         private List<SendingPackage> _waitAckList;
 
-        private List<UInt32> _sendAckList;
-
-        private Dictionary<UInt32, RecvingPackage> _recvQueue;
+        private List<RecvingPackage> _recvQueue;//data in stream
+        private Queue<RecvingPackage> _recvBuffer;//wait to get
+        private const int MaxRecvWindSize = 100;
         private UInt32 _nextRecvSeqNo;
         private UInt32 _lastRecvSeqNo = UInt32.MaxValue;
         private UInt32 _una;
@@ -49,8 +49,6 @@ namespace MobaNet
 
         private const ushort DataFrameHeaderLength = 72 / 8;
         private const ushort PublicFrameHeaderLength = 48 / 8;
-
-        private List<RecvingPackage> _assmblingPackages;
 
         protected RUDP_STATE _state;
         float _stateTimer;
@@ -82,10 +80,8 @@ namespace MobaNet
             _sendBuffer = new Queue<byte[]>();
             _waitAckList = new List<SendingPackage>();
 
-            _sendAckList = new List<UInt32>();
-
-            _recvQueue = new Dictionary<UInt32, RecvingPackage>();
-            _assmblingPackages = new List<RecvingPackage>();
+            _recvQueue = new List<RecvingPackage>(MaxRecvWindSize);
+            _recvBuffer = new Queue<RecvingPackage>();
             RUDPReset();
         }
 
@@ -95,10 +91,8 @@ namespace MobaNet
             _sendBuffer.Clear();
             _waitAckList.Clear();
 
-            _sendAckList.Clear();
-
             _recvQueue.Clear();
-            _assmblingPackages.Clear();
+            _recvBuffer.Clear();
                
             _nextRecvSeqNo = 0;
             _una = _nextRecvSeqNo;
@@ -135,7 +129,7 @@ namespace MobaNet
                 ProcessRecvQueue(rawData, len);
                 Recv(ref rawData, ref len);
             }
-            MobaNetworkManager.Instance.waitingRecvNum = _recvQueue.Count + _assmblingPackages.Count;
+            MobaNetworkManager.Instance.waitingRecvNum = _recvQueue.Count + _recvBuffer.Count;
 
             ProcessSendQueue(deltaTime);
         }
@@ -265,16 +259,36 @@ namespace MobaNet
                         Array.Reverse(maxPieceBytes);
                     ushort maxPiece = BitConverter.ToUInt16(maxPieceBytes, 0);
                     byte[] data = reader.ReadBytes(currentLen - DataFrameHeaderLength);
-                    if (!_recvQueue.ContainsKey(seqData) && seqData >= _nextRecvSeqNo)
+                    if (seqData > _una && seqData < _una + MaxRecvWindSize)
                     {
-                        //replace dummy packages
-                        RecvingPackage recvPackage = new RecvingPackage();
-                        recvPackage.Data = data;
-                        recvPackage.MaxPiece = maxPiece;
-                        recvPackage.RecvingSequenceNo = seqData;
-                        _recvQueue.Add(seqData, recvPackage);
+                        if(_recvQueue[(int)(seqData - _una - 1)] != null)
+                        {
+                            //replace dummy packages
+                            RecvingPackage recvPackage = new RecvingPackage();
+                            recvPackage.Data = data;
+                            recvPackage.MaxPiece = maxPiece;
+                            recvPackage.RecvingSequenceNo = seqData;
+                            _recvQueue[(int)(seqData - _una - 1)] = recvPackage;
+
+                            //Calculate una
+                            int i = 0;
+                            for(; i < _recvQueue.Count; i++, _una++)
+                            {
+                                if (_recvQueue[i] == null)
+                                {
+                                    break;
+                                }
+                                else
+                                {
+                                    _recvBuffer.Enqueue(_recvQueue[i]);
+                                    _recvQueue.Add(null);
+                                }
+                            }
+                            _recvQueue.RemoveRange(0, i);
+                        }
+                        SendAck(seqData);
                     }
-                    SendAck(seqData);
+                    
                 }
                 else if (control == (byte)3) //ACK, FIN+ACK
                 {
@@ -341,20 +355,6 @@ namespace MobaNet
 
             if (_state == RUDP_STATE.ESTABLISED)
             {
-                //Calculate una
-                _una = _nextRecvSeqNo;
-                while (true)
-                {
-                    if (_recvQueue.ContainsKey(_una + 1))
-                    {
-                        _una++;
-                    }
-                    else
-                    {
-                        break;
-                    }
-                }
-
                 //fastack
                 for (int i = 0; i <= _waitAckList.Count; i++)
                 {
@@ -365,11 +365,11 @@ namespace MobaNet
                 }
 
                 //process correspondance's una
-                ProcessUna(coUna);
+                ProcessCoUna(coUna);
             }
         }
 
-        void ProcessUna(uint coUna)
+        void ProcessCoUna(uint coUna)
         {
             for (int i = _waitAckList.Count - 1; i >= 0; i--)
             {
@@ -382,6 +382,10 @@ namespace MobaNet
 
         void SendAck(UInt32 seqNo)
         {
+            if(seqNo <= _una)
+            {
+                return;
+            }
             byte[] ackFrame = new byte[7];
             MemoryStream ms = new MemoryStream(ackFrame);
             BinaryWriter bw = new BinaryWriter(ms);
@@ -473,57 +477,42 @@ namespace MobaNet
                 _state = RUDP_STATE.LAST_ACK;
             }
 
-            if (_recvQueue == null)
+            if (_recvBuffer == null)
                 return null;
 
             //Queue is empty
-            if (_recvQueue.Count <= 0)
+            if (_recvBuffer.Count <= 0)
             {
                 return null;
             }
-            
-            if (!_recvQueue.ContainsKey(_nextRecvSeqNo))
-                return null;
-            RecvingPackage package = _recvQueue[_nextRecvSeqNo];
+
+            int MaxPiece = _recvBuffer.Peek().MaxPiece;
             //No enough pieces
-            if (_recvQueue.Count + _assmblingPackages.Count < package.MaxPiece)
+            if (_recvBuffer.Count < MaxPiece)
             {
                 //Debug.Log(string.Format("Not Enough Packet, Need: {0}, Queue: {1}, Assembling: {2}", package.MaxPiece, _assmblingPackages.Count, _recvQueue.Count));
                 return null;
             }
 
-
-            //put non-dummy frames to assemble list
-            int assemblingPackagesNum = _assmblingPackages.Count;
-            //Debug.Log("MaxPiece: " + package.MaxPiece.ToString());
-            for (int i = 0; i < package.MaxPiece - assemblingPackagesNum; i++)
-            {
-                if (!_recvQueue.ContainsKey(_nextRecvSeqNo))
-                    break;
-                RecvingPackage apackage = _recvQueue[_nextRecvSeqNo];
-                _recvQueue.Remove(apackage.RecvingSequenceNo);
-                _assmblingPackages.Add(apackage);
-                _nextRecvSeqNo++;
-            }
-
-            if (_assmblingPackages.Count != package.MaxPiece)
-                return null;
-
-            //calculate data length
             int dataLength = 0;
-            foreach (RecvingPackage apackage in _assmblingPackages)
+            List<byte[]> resultData = new List<byte[]>();
+            //Debug.Log("MaxPiece: " + package.MaxPiece.ToString());
+            for (int i = 0; i < MaxPiece; i++)
             {
+                RecvingPackage apackage = _recvBuffer.Dequeue();
+                resultData.Add(apackage.Data);
                 dataLength += apackage.Data.Length;
+                _nextRecvSeqNo++;
             }
 
             byte[] ret = new byte[dataLength];
             int currentPos = 0;
-            foreach (RecvingPackage apackage in _assmblingPackages)
+            for (int i = 0; i < resultData.Count; i++)
             {
-                apackage.Data.CopyTo(ret, currentPos);
-                currentPos += apackage.Data.Length;
+                byte[] Data = resultData[i];
+                Data.CopyTo(ret, currentPos);
+                currentPos += Data.Length;
             }
-            _assmblingPackages.Clear();
             return ret;
         }
         #endregion
