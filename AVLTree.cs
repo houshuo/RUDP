@@ -359,7 +359,7 @@ public class AVLTree<T> where T: class
         Node lastchild = newNode.rchild;
         newNode.rchild = node;
         node.parent = newNode;
-        node.rchild = lastchild;
+        node.lchild = lastchild;
         if (lastchild != null)
             lastchild.parent = node;
 
