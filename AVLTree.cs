@@ -162,7 +162,17 @@ public class AVLTree<T> where T: class
                 //use next item in open hash list to replace this one, no need to change tree structure
                 curNode.nextOpenHash.parent = curNode.parent;
                 curNode.nextOpenHash.lchild = curNode.lchild;
+                if(curNode.lchild != null)
+                {
+                    curNode.lchild.parent = curNode.nextOpenHash;
+                }
+                
                 curNode.nextOpenHash.rchild = curNode.rchild;
+                if (curNode.rchild != null)
+                {
+                    curNode.rchild.parent = curNode.nextOpenHash;
+                }
+
                 curNode.nextOpenHash.height = curNode.height;
                 if(curNode.parent == null)
                 {
