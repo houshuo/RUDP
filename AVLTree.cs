@@ -11,7 +11,6 @@ public class AVLTree<T> where T: class
 
         public T item;
 
-        public Node next, last; //for linked list
         public Node parent, lchild, rchild;//for avl tree
         public Node nextOpenHash;
         public int height;
@@ -54,25 +53,16 @@ public class AVLTree<T> where T: class
     }
 
     private Node Root;
-    private Node ListHead;
 
 	public void Clear()
     {
         Root = null;
-        ListHead = null;
     }
 
     public void Add(T item)
     {
         Node newNode = new Node(item);
-        //linked list part
-        newNode.next = ListHead;
-        if (ListHead != null)
-        {
-            ListHead.last = newNode;
-        }
-        ListHead = newNode;
-        //avl part
+
         if(Root == null)
         {
             Root = newNode;
@@ -311,23 +301,6 @@ public class AVLTree<T> where T: class
                 return;
             }
         }
-
-        //linked list part
-        if (curNode.last != null)
-        {
-            curNode.last.next = curNode.next;
-        }
-        else
-        {
-            ListHead = curNode.next;
-        }
-
-        if(curNode.next != null)
-        {
-            curNode.next.last = curNode.last;
-        }
-
-        curNode.last = curNode.next = curNode.lchild = curNode.rchild = curNode.parent = curNode.nextOpenHash = null;
     }
 
     private Node LeftRotate(Node node)
