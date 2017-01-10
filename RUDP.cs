@@ -307,14 +307,6 @@ namespace MobaNet
                         SendingPackage sendPackage = _waitAckList.Find((SendingPackage input) => input.SendingSequenceNo == seqData);
                         if (sendPackage != null)
                         {
-                            if (MobaNetworkManager.Instance.pingQueue.Count > 10)
-                            {
-                                int oldPing = MobaNetworkManager.Instance.pingQueue.Dequeue();
-                                MobaNetworkManager.Instance.ping -= oldPing;
-                            }
-                            int newPing = (int)(DateTime.Now - sendPackage.FirstSendTimestamp).TotalMilliseconds;
-                            MobaNetworkManager.Instance.pingQueue.Enqueue(newPing);
-                            MobaNetworkManager.Instance.ping += newPing;
                             _waitAckList.Remove(sendPackage);
 
                             if(maxAckSeq < seqData)
@@ -675,17 +667,6 @@ namespace MobaNet
             }
             catch(SocketException e)
             {
-                if (!_socketSendErrorSet.Contains(e.SocketErrorCode.ToString()))
-                {
-                    Debug.Log("RUDP Send Exception: " + e.SocketErrorCode.ToString());
-                    _socketSendErrorSet.Add(e.SocketErrorCode.ToString());
-                }
-
-                if (e.SocketErrorCode != SocketError.WouldBlock)
-                {
-                    OnRUDPConnectionDisconnect();
-                    return false;
-                }
                     
             }
             return true;
@@ -712,16 +693,7 @@ namespace MobaNet
             }
             catch(SocketException e)
             {
-                if (!_socketRecvErrorSet.Contains(e.SocketErrorCode.ToString()))
-                {
-                    Debug.Log("RUDP Recv Exception: " + e.SocketErrorCode.ToString());
-                    _socketRecvErrorSet.Add(e.SocketErrorCode.ToString());
-                }
 
-                if (e.SocketErrorCode != SocketError.WouldBlock && e.SocketErrorCode != SocketError.ConnectionReset)
-                {
-                    OnRUDPConnectionDisconnect();
-                }
             }
         }
 
