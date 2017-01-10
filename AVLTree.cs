@@ -117,11 +117,10 @@ public class AVLTree<T> where T: class
 
             if(!crash)
             {
-                //a new node is inserted, and balance operation is needed
+                //no crash means a new node is inserted into tree, so balance operation is needed
                 while(curNode != null)
                 {
                     Node tmpNode = Balance(curNode);
-                    curNode.height = Math.Max(curNode.lchild != null ? curNode.lchild.height : -1, curNode.rchild != null ? curNode.rchild.height : -1) + 1;
                     curNode = tmpNode.parent;
                 }
             }
@@ -216,7 +215,6 @@ public class AVLTree<T> where T: class
                     }
 
                     balanceStart = nextNode.parent;
-                    nextNode.parent.height = Math.Max(nextNode.parent.lchild != null ? nextNode.parent.lchild.height : -1, nextNode.parent.rchild != null ? nextNode.parent.rchild.height : -1) + 1;
                     nextNode.parent.lchild = nextNode.rchild;
                     if(nextNode.rchild != null)
                         nextNode.rchild.parent = nextNode.parent;
@@ -263,13 +261,11 @@ public class AVLTree<T> where T: class
                     }
                     realChild.parent = curNode.parent;
                     balanceStart = curNode.parent;
-                    curNode.parent.height = Math.Max(curNode.parent.lchild != null ? curNode.parent.lchild.height : -1, curNode.parent.rchild != null ? curNode.parent.rchild.height : -1) + 1;
                 }
 
                 while (balanceStart != null)
                 {
                     Node tmpNode = Balance(balanceStart);
-                    balanceStart.height = Math.Max(balanceStart.lchild != null ? balanceStart.lchild.height : -1, balanceStart.rchild != null ? balanceStart.rchild.height : -1) + 1;
                     balanceStart = tmpNode.parent;
                 }
                 
@@ -332,6 +328,8 @@ public class AVLTree<T> where T: class
         node.rchild = lastchild;
         if(lastchild != null)
             lastchild.parent = node;
+
+        node.height = Math.Max(node.lchild != null ? node.lchild.height : -1, node.rchild != null ? node.rchild.height : -1) + 1;
         return newNode;
     }
 
@@ -364,6 +362,8 @@ public class AVLTree<T> where T: class
         node.rchild = lastchild;
         if (lastchild != null)
             lastchild.parent = node;
+
+        node.height = Math.Max(node.lchild != null ? node.lchild.height : -1, node.rchild != null ? node.rchild.height : -1) + 1;
         return newNode;
     }
 
