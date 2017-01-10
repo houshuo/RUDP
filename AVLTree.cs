@@ -70,6 +70,7 @@ public class AVLTree<T> where T: class
         else
         {
             Node curNode = Root;
+            Node balanceStart = null;
             bool crash = false;
             while(true)
             {
@@ -83,7 +84,6 @@ public class AVLTree<T> where T: class
                     {
                         curNode.lchild = newNode;
                         newNode.parent = curNode;
-                        curNode.height++;
                         break;
                     }
                 }
@@ -97,7 +97,6 @@ public class AVLTree<T> where T: class
                     {
                         curNode.rchild = newNode;
                         newNode.parent = curNode;
-                        curNode.height++;
                         break;
                     }
                 }
@@ -120,8 +119,8 @@ public class AVLTree<T> where T: class
                 //no crash means a new node is inserted into tree, so balance operation is needed
                 while(curNode != null)
                 {
-                    Node tmpNode = Balance(curNode);
-                    curNode = tmpNode.parent;
+                    curNode.height = Math.Max(curNode.lchild != null ? curNode.lchild.height : -1, curNode.rchild != null ? curNode.rchild.height : -1) + 1;
+                    curNode = Balance(curNode).parent;
                 }
             }
         }
@@ -204,6 +203,7 @@ public class AVLTree<T> where T: class
                             curNode.parent.rchild = null;
                         }
                     }
+                    balanceStart = curNode.parent;
                 }
                 else if(curNode.isFullNode())
                 {
@@ -263,10 +263,12 @@ public class AVLTree<T> where T: class
                     balanceStart = curNode.parent;
                 }
 
+                curNode.lchild = curNode.rchild = curNode.parent = curNode.nextOpenHash = null;
+
                 while (balanceStart != null)
                 {
-                    Node tmpNode = Balance(balanceStart);
-                    balanceStart = tmpNode.parent;
+                    balanceStart.height = Math.Max(balanceStart.lchild != null ? balanceStart.lchild.height : -1, balanceStart.rchild != null ? balanceStart.rchild.height : -1) + 1;
+                    balanceStart = Balance(balanceStart).parent;
                 }
                 
             }
