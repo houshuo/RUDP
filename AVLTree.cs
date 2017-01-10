@@ -329,6 +329,7 @@ public class AVLTree<T> where T: class
         if(lastchild != null)
             lastchild.parent = node;
 
+        node.height = Math.Max(node.lchild != null ? node.lchild.height : -1, node.rchild != null ? node.rchild.height : -1) + 1;
         newNode.height = Math.Max(newNode.lchild != null ? newNode.lchild.height : -1, newNode.rchild != null ? newNode.rchild.height : -1) + 1;
         return newNode;
     }
@@ -363,6 +364,7 @@ public class AVLTree<T> where T: class
         if (lastchild != null)
             lastchild.parent = node;
 
+        node.height = Math.Max(node.lchild != null ? node.lchild.height : -1, node.rchild != null ? node.rchild.height : -1) + 1;
         newNode.height = Math.Max(newNode.lchild != null ? newNode.lchild.height : -1, newNode.rchild != null ? newNode.rchild.height : -1) + 1;
         return newNode;
     }
