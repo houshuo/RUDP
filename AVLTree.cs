@@ -221,7 +221,16 @@ public class AVLTree<T> where T: class
 
                     nextNode.parent = curNode.parent;
                     nextNode.lchild = curNode.lchild;
+                    if(curNode.lchild != null)
+                    {
+                        curNode.lchild.parent = nextNode;
+                    }
                     nextNode.rchild = curNode.rchild;
+                    if(curNode.rchild != null)
+                    {
+                        curNode.rchild.parent = nextNode;
+                    }
+
                     if(curNode.parent == null)
                     {
                         Root = nextNode;
