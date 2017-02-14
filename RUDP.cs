@@ -12,8 +12,9 @@ namespace MobaNet
     {
         public byte[] Content;
         public UInt32 SendingSequenceNo;
-        public DateTime LastSendTimestamp;
-        public DateTime FirstSendTimestamp;
+        public float LastSendTimestamp;
+        public float FirstSendTimestamp;
+        public float RetransmissionInterval;
         public int fastack = 0;
     }
 
@@ -26,50 +27,36 @@ namespace MobaNet
 
     public class RUDP: IConnection
     {
-        public static ushort MTU = 1464;
-        public uint RetransmissionInterval = 100;//in millisecond
+        public static ushort MTU = 1400;
+        public float DEFAULT_RTO = 0.1f;
+        public float MAX_RTO = 2f;
+        public float RTO;//in millisecond
 
         static readonly public int msgIdSize = 4;
         public bool reverseByte = true;
 
-        public ushort MaxWaitingSendLength = 100;
+        public ushort MaxWaitingSendLength = 32;
         private Queue<SendingPackage> _sendQueue;//all input waiting here
         private Queue<byte[]> _sendBuffer;//data in stream
         private List<SendingPackage> _waitAckList;
 
         private List<RecvingPackage> _recvQueue;//data in stream
         private Queue<RecvingPackage> _recvBuffer;//wait to get
-        private const int MaxRecvWindSize = 100;
-        private UInt32 _lastRecvSeqNo = UInt32.MaxValue;
+        private const int MaxRecvWindSize = 128;
         private UInt32 _una;
 
         private UInt32 _currentSnedSeq;
 
         private const ushort DataFrameHeaderLength = 72 / 8;
-        private const ushort PublicFrameHeaderLength = 48 / 8;
+        private const ushort PublicFrameHeaderLength = 80 / 8;
 
-        protected RUDP_STATE _state;
-        float _stateTimer;
-
-        const float SynReceivedTimeout = 2;
-        const float LastAckTimeout = 5;
-        const float AckTimeout = 10;
-
-        protected enum RUDP_STATE
-        {
-            CLOSED,
-            SYN_SEND,
-            ESTABLISED,
-            LAST_ACK
-        }
+        private uint SessionID;
+        private float Clock;
 
         enum PACKAGE_CATE
         {
             DATA = 4,
             ACK = 3,
-            FIN_ACK = 2,
-            FIN = 6,
-            RST = 5
         }
 
         public RUDP()
@@ -78,19 +65,20 @@ namespace MobaNet
             _sendBuffer = new Queue<byte[]>();
             _waitAckList = new List<SendingPackage>();
 
-            _recvQueue = new List<RecvingPackage>(MaxWaitingSendLength);
+            _recvQueue = new List<RecvingPackage>(MaxRecvWindSize);
             _recvBuffer = new Queue<RecvingPackage>();
             RUDPReset();
         }
 
         public void RUDPReset()
         {
+            Debug.Log("RUDPReset");
             _sendQueue.Clear();
             _sendBuffer.Clear();
             _waitAckList.Clear();
 
             _recvQueue.Clear();
-            for (int i = 0; i < MaxWaitingSendLength; i++)
+            for (int i = 0; i < MaxRecvWindSize; i++)
             {
                 _recvQueue.Add(null);
             }
@@ -98,39 +86,30 @@ namespace MobaNet
                
             _una = 0;
             _currentSnedSeq = 1;
-
-            _state = RUDP_STATE.CLOSED;
-            _stateTimer = 0;
+            SessionID = 0;
             Close();
         }
 
-        public bool RUDPConnect(IPEndPoint remoteIp, byte[] cookie)
+        public bool RUDPConnect(IPEndPoint remoteIp, uint sessionID)
         {
-            if (_state == RUDP_STATE.SYN_SEND || _state == RUDP_STATE.CLOSED)
-            {
-                if(_state == RUDP_STATE.SYN_SEND)
-                    RUDPReset();
-                Connect(remoteIp);
-                SendSYN(cookie);
-                _state = RUDP_STATE.SYN_SEND;
-                _stateTimer = 0;
-                return true;
-            }  
-            else 
-                return false;
+            Connect(remoteIp);
+            SessionID = sessionID;
+            Clock = 0;
+            return true;
         }
 
         public void Tick(float deltaTime)
         {
+            Clock += deltaTime;
             byte[] rawData = null;
             int len = 0;
-            Recv(ref rawData, ref len);
-            while (rawData != null && len > 0)
+            while (Recv(ref rawData, ref len))
             {
-                ProcessRecvQueue(rawData, len);
-                Recv(ref rawData, ref len);
+                if (rawData != null && len > 0)
+                {
+                    ProcessRecvQueue(rawData, len);
+                }
             }
-            MobaNetworkManager.Instance.waitingRecvNum = _recvQueue.Count + _recvBuffer.Count;
 
             ProcessSendQueue(deltaTime);
         }
@@ -138,59 +117,43 @@ namespace MobaNet
         byte[] SendStreamBuffer = new byte[MTU]; // for final frame construction 
         void ProcessSendQueue(float deltaTime)
         {
-            if (_state == RUDP_STATE.SYN_SEND)
-            {
-                _stateTimer += deltaTime;
-                if (_stateTimer > SynReceivedTimeout)
-                {
-                    OnRUDPConnectionDisconnect();
-                }
-            }
-            else if (_state == RUDP_STATE.LAST_ACK)
-            {
-                _stateTimer += deltaTime;
-                if (_stateTimer > LastAckTimeout)
-                {
-                    SendFINACK();
-                    _stateTimer = 0;
-                }
+            //Put available packages to waiting dict
+            int readyToSendNum = 0;
 
-            }
-            else if (_state == RUDP_STATE.ESTABLISED)
+            readyToSendNum = Math.Min(MaxWaitingSendLength - _waitAckList.Count, _sendQueue.Count);
+            for (int i = 0; i < readyToSendNum; i++)
             {
-                //Put available packages to waiting dict
-                int readyToSendNum = 0;
+                SendingPackage package = _sendQueue.Dequeue();
+                _sendBuffer.Enqueue(package.Content);
+                package.LastSendTimestamp = Clock;
+                package.FirstSendTimestamp = Clock;
+                _waitAckList.Add(package);
+            }
 
-                readyToSendNum = Math.Min(MaxWaitingSendLength - _waitAckList.Count, _sendQueue.Count);
-                for (int i = 0; i < readyToSendNum; i++)
+            //Re-send un-acked packages
+            //string pendingList = "";
+            for (int i = 0; i < _waitAckList.Count; i++)
+            {
+                SendingPackage package = _waitAckList[i];
+                float elapsedTime = Clock - package.LastSendTimestamp;
+                bool needRetransmit = elapsedTime > package.RetransmissionInterval;
+                bool fastack = package.fastack >= 2;
+                if (needRetransmit || fastack)
                 {
-                    SendingPackage package = _sendQueue.Dequeue();
                     _sendBuffer.Enqueue(package.Content);
-                    package.LastSendTimestamp = DateTime.Now;
-                    package.FirstSendTimestamp = DateTime.Now;
-                    _waitAckList.Add(package);
-                }
-
-                //Re-send un-acked packages
-                //string pendingList = "";
-                for (int i = 0; i < _waitAckList.Count; i++)
-                {
-                    SendingPackage package = _waitAckList[i];
-                    if ((DateTime.Now - package.FirstSendTimestamp).Seconds > AckTimeout)
+                    package.LastSendTimestamp = Clock;
+                    if(fastack)
                     {
-                        OnRUDPConnectionDisconnect();
-                        return;
-                    }
-
-                    if ((DateTime.Now - package.LastSendTimestamp).Milliseconds > RetransmissionInterval || package.fastack >= 2)
-                    {
-                        _sendBuffer.Enqueue(package.Content);
-                        package.LastSendTimestamp = DateTime.Now;
                         package.fastack = 0;
                     }
+                    else if(needRetransmit)
+                    {
+                        RTO = (uint)(RTO * 1.5 > MAX_RTO ? MAX_RTO : RTO * 1.5);
+                        package.RetransmissionInterval = RTO;
+                    }
+                    
                 }
             }
-            MobaNetworkManager.Instance.waitingSendNum = _sendQueue.Count + _waitAckList.Count;
 
             int currentPos = PublicFrameHeaderLength;
             //actually send
@@ -218,13 +181,15 @@ namespace MobaNet
             BinaryReader reader = new BinaryReader(msgStream);
             //CRC
             byte[] checksumBytes = reader.ReadBytes(2);
+
+            //SESSION
+            byte[] sessionBytes = reader.ReadBytes(4);
             if (BitConverter.IsLittleEndian)
-                Array.Reverse(checksumBytes);
-            UInt16 checksum = BitConverter.ToUInt16(checksumBytes, 0);
-            UInt16 calChecksum = CRCCheck.crc16(rawData, 2, len);
-            if (checksum != calChecksum)
+                Array.Reverse(sessionBytes);
+            UInt32 sessionID = BitConverter.ToUInt32(sessionBytes, 0);
+            //Discard mismatch session package
+            if(sessionID != this.SessionID)
             {
-                Debug.LogWarning("Checksum Failed!!!!!!");
                 return;
             }
 
@@ -249,10 +214,8 @@ namespace MobaNet
 
                 //Get controll bits
                 byte control = reader.ReadByte();
-                if (control == (byte)4)
+                if (control == (byte)PACKAGE_CATE.DATA)
                 {
-                    if (_state != RUDP_STATE.ESTABLISED)
-                        return;
                     //this is a data frame
                     byte[] seqDataBytes = reader.ReadBytes(4);
                     if (BitConverter.IsLittleEndian)
@@ -292,57 +255,37 @@ namespace MobaNet
                             _recvQueue.RemoveRange(0, i);
                         }
                         SendAck(seqData);
-                    }
-                    
+                    }                  
+                      
                 }
-                else if (control == (byte)3) //ACK, FIN+ACK
+                else if (control == (byte)PACKAGE_CATE.ACK) //ACK, FIN+ACK
                 {
                     byte[] seqDataBytes = reader.ReadBytes(4);
                     if (BitConverter.IsLittleEndian)
                         Array.Reverse(seqDataBytes);
                     UInt32 seqData = BitConverter.ToUInt32(seqDataBytes, 0);
                     //Debug.Log("Recv Ack SeqNo: " + seqData.ToString());
-                    if (_state == RUDP_STATE.ESTABLISED)
-                    {
-                        SendingPackage sendPackage = _waitAckList.Find((SendingPackage input) => input.SendingSequenceNo == seqData);
-                        if (sendPackage != null)
-                        {
-                            _waitAckList.Remove(sendPackage);
 
-                            if(maxAckSeq < seqData)
-                            {
-                                maxAckSeq = seqData;
-                            }
+                    SendingPackage sendPackage = _waitAckList.Find((SendingPackage input) => input.SendingSequenceNo == seqData);
+                    if (sendPackage != null)
+                    {
+                        int newPing = (int)(Clock - sendPackage.FirstSendTimestamp);
+                        MobaNetworkManager.Instance.AddPing(newPing);
+                        _waitAckList.Remove(sendPackage);
+
+                        if(maxAckSeq < seqData)
+                        {
+                            maxAckSeq = seqData;
                         }
                     }
-                    else if (_state == RUDP_STATE.LAST_ACK)
+
+                    //Get an ack, set all rto to default
+                    RTO = DEFAULT_RTO;
+                    for(int i = 0; i < _waitAckList.Count; i++)
                     {
-                        if (seqData == _currentSnedSeq)
-                            RUDPReset();
+                        _waitAckList[i].RetransmissionInterval = RTO;
                     }
-                }
-                else if (control == (byte)2)//SYN+ACK
-                {
-                    byte[] seqDataBytes = reader.ReadBytes(4);
-                    if (BitConverter.IsLittleEndian)
-                        Array.Reverse(seqDataBytes);
-                    UInt32 seqData = BitConverter.ToUInt32(seqDataBytes, 0);
-                    SendAck(seqData);
-                    _una++;
-                    _state = RUDP_STATE.ESTABLISED;
-                    //lastTime = DateTime.Now;
-                    _lastRecvSeqNo = UInt32.MaxValue;
-                }
-                else if (control == (byte)6)//FIN
-                {
-                    byte[] seqDataBytes = reader.ReadBytes(4);
-                    if (BitConverter.IsLittleEndian)
-                        Array.Reverse(seqDataBytes);
-                    _lastRecvSeqNo = BitConverter.ToUInt32(seqDataBytes, 0);
-                }
-                else if (control == (byte)5)//RST
-                {
-                    OnRUDPConnectionDisconnect();
+                    
                 }
                 else
                 {
@@ -350,20 +293,17 @@ namespace MobaNet
                 }
             }
 
-            if (_state == RUDP_STATE.ESTABLISED)
+            //fastack
+            for (int i = 0; i < _waitAckList.Count; i++)
             {
-                //fastack
-                for (int i = 0; i < _waitAckList.Count; i++)
+                if (_waitAckList[i].SendingSequenceNo < maxAckSeq)
                 {
-                    if (_waitAckList[i].SendingSequenceNo < maxAckSeq)
-                    {
-                        _waitAckList[i].fastack++;
-                    }
+                    _waitAckList[i].fastack++;
                 }
-
-                //process correspondance's una
-                ProcessCoUna(coUna);
             }
+
+            //process correspondance's una
+            ProcessCoUna(coUna);
         }
 
         void ProcessCoUna(uint coUna)
@@ -402,55 +342,14 @@ namespace MobaNet
 
             _sendBuffer.Enqueue(ackFrame);
         }
-
-        private void SendSYN(byte[] cookie)
-        {
-            Debug.Log("SendSYN");
-            byte[] frame = new byte[3 + cookie.Length];
-            MemoryStream ms = new MemoryStream(frame);
-            BinaryWriter bw = new BinaryWriter(ms);
-            byte[] lenBytes = BitConverter.GetBytes((ushort)(1 + cookie.Length));
-            if (BitConverter.IsLittleEndian)
-                Array.Reverse(lenBytes);
-            bw.Write(lenBytes);//0 len
-            bw.Write((byte)1);//control 2
-
-            bw.Write(cookie);//cookie 3
-            bw.Close();
-
-            //Debug.Log("Send SYN: ");
-            _sendBuffer.Enqueue(frame);
-        }
-
-        private void SendFINACK()
-        {
-            byte[] frame = new byte[7];
-            MemoryStream ms = new MemoryStream(frame);
-            BinaryWriter bw = new BinaryWriter(ms);
-            byte[] lenBytes = BitConverter.GetBytes((ushort)(5));
-            if (BitConverter.IsLittleEndian)
-                Array.Reverse(lenBytes);
-            bw.Write(lenBytes);//0 len
-            bw.Write((byte)7);//control 2
-            byte[] AckSeqBytes = BitConverter.GetBytes(_currentSnedSeq);
-            if (BitConverter.IsLittleEndian)
-                Array.Reverse(AckSeqBytes);
-            bw.Write(AckSeqBytes);//seqNo 3
-            
-            bw.Close();
-
-            //Debug.Log("Send FINACK");
-            _sendBuffer.Enqueue(frame);
-        }
-
-        #region IsConnected
+#region IsConnected
         public bool IsConnected()
         {
-            return _state == RUDP_STATE.ESTABLISED;
+            return SessionID != 0;
         }
-        #endregion
+#endregion
 
-        #region GetMsg
+#region GetMsg
         public MsgObject GetMsg()
         {
             byte[] thepacket = GetReliableMsg();
@@ -479,13 +378,6 @@ namespace MobaNet
 
         protected byte[] GetReliableMsg()
         {
-
-            if (_una == _lastRecvSeqNo)
-            {
-                SendFINACK();
-                _state = RUDP_STATE.LAST_ACK;
-            }
-
             if (_recvBuffer == null)
                 return null;
 
@@ -530,9 +422,9 @@ namespace MobaNet
             }
             return ret;
         }
-        #endregion
+#endregion
 
-        #region SendMessage
+#region SendMessage
         public void SendMessage(OpCode f_id, byte[] f_buf)
         {
             SendMsg((uint)f_id, f_buf);
@@ -590,15 +482,16 @@ namespace MobaNet
                 package.Content = frame;
                 package.SendingSequenceNo = _currentSnedSeq;
                 package.fastack = 0;
+                package.RetransmissionInterval = RTO;
                 _currentSnedSeq++;
                 currentPosition += dataLength;
                 ret.Add(package);
             }
             return ret;
         }
-        #endregion
+#endregion
 
-        #region socket
+#region socket
         protected virtual void Connect(IPEndPoint remoteIp)
         {
 
@@ -606,10 +499,15 @@ namespace MobaNet
 
         protected virtual bool Send(byte[] data, int len)
         {
+            byte[] sessionBytes = BitConverter.GetBytes(SessionID);
+            if (BitConverter.IsLittleEndian)
+                Array.Reverse(sessionBytes);
+            Array.Copy(sessionBytes, 0, data, 2, 4);
+
             byte[] unaBytes = BitConverter.GetBytes(_una);
             if (BitConverter.IsLittleEndian)
                 Array.Reverse(unaBytes);
-            Array.Copy(unaBytes, 0, data, 2, 4);
+            Array.Copy(unaBytes, 0, data, 6, 4);
 
             UInt16 checksum = CRCCheck.crc16(data, 2, len);
             byte[] checksumBytes = BitConverter.GetBytes(checksum);
@@ -619,39 +517,40 @@ namespace MobaNet
             return false;
         }
 
-        protected virtual void Recv(ref byte[] data, ref int len)
+        protected virtual bool Recv(ref byte[] data, ref int len)
         {
-
+            byte[] checksumBytes = new byte[2] { data[0], data[1] };
+            if (BitConverter.IsLittleEndian)
+                Array.Reverse(checksumBytes);
+            UInt16 checksum = BitConverter.ToUInt16(checksumBytes, 0);
+            UInt16 calChecksum = CRCCheck.crc16(data, 2, len);
+            if (checksum != calChecksum)
+            {
+                data = null;
+                len = 0;
+            }
+            return true;
         }
 
         protected virtual void Close()
         {
 
         }
-
-        protected virtual void OnRUDPConnectionDisconnect()
-        {
-            Debug.Log("OnRUDPConnectionDisconnect");
-            RUDPReset();
-        }
-        #endregion
+#endregion
     }
 
     public class RUDPConnection : RUDP
     {
         private Socket m_socket;
 
-        readonly byte[] _recvBuffer = new byte[MTU];
+        readonly byte[] _recvBuffer = new byte[2000];
 
-        public event Action OnDisconnect;
-
-        HashSet<string> _socketSendErrorSet = new HashSet<string>();
-        HashSet<string> _socketRecvErrorSet = new HashSet<string>();
+        private IPEndPoint FarEnd;
 
         protected override bool Send(byte[] f_data, int len)
         {
             base.Send(f_data, len);
-            if (m_socket == null)
+            if (m_socket == null || FarEnd == null)
                 return false;
             try
             {
@@ -662,25 +561,25 @@ namespace MobaNet
                     sb.Append(f_data[i] + ", ");
                 }
                 Debug.Log(sb.ToString());*/
-                m_socket.Send(f_data, len, SocketFlags.None);
-                
+
+                int n = m_socket.SendTo(f_data, len, SocketFlags.None, FarEnd);
             }
             catch(SocketException e)
             {
-                    
             }
             return true;
         }
         
-        protected override void Recv(ref byte[] data, ref int len)
+        protected override bool Recv(ref byte[] data, ref int len)
         {
             data = null;
             len = 0;
-            if (m_socket == null)
-                return;
+            if (m_socket == null || FarEnd == null)
+                return false;
             try
             {
-                int n = m_socket.Receive(_recvBuffer);
+                EndPoint recvEndPoint = (EndPoint)FarEnd;
+                int n = m_socket.ReceiveFrom(_recvBuffer, ref recvEndPoint);
                 /*StringBuilder sb = new StringBuilder();
                 sb.Append("Recv: ");
                 for (int i = 0; i < n; i++)
@@ -693,21 +592,16 @@ namespace MobaNet
             }
             catch(SocketException e)
             {
-
+                return false;
             }
-        }
 
-        protected override void OnRUDPConnectionDisconnect()
-        {
-            base.OnRUDPConnectionDisconnect();
-            OnDisconnect();
+            return base.Recv(ref data, ref len);
         }
 
         protected override void Close()
         {
             if (m_socket != null)
             {
-                m_socket.Close();
                 m_socket = null;
             }
         }
@@ -715,24 +609,13 @@ namespace MobaNet
         protected override void Connect(IPEndPoint remoteIp)
         {
             Close();
-            Socket newSocket = null;
-            try
-            {
-                newSocket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-                newSocket.Blocking = false;
-                newSocket.DontFragment = true;
-                newSocket.SendBufferSize = 81920;
-                newSocket.ReceiveBufferSize = 81920;
-                newSocket.Connect(remoteIp);
-            }
-            catch (SocketException e)
-            {
-                if (e.SocketErrorCode != SocketError.WouldBlock)
-                {
-                    return;
-                }
-            }
-            m_socket = newSocket;
+
+            m_socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            m_socket.Blocking = false;
+            m_socket.DontFragment = true;
+            m_socket.SendBufferSize = 81920;
+            m_socket.ReceiveBufferSize = 81920;
+            FarEnd = remoteIp;
         }
 
     }
