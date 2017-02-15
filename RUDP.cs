@@ -157,11 +157,27 @@ namespace MobaNet
 
             int currentPos = PublicFrameHeaderLength;
             //actually send
+            int iWaitAck = 0;
             while (_sendBuffer.Count > 0)
             {
                 byte[] nextSendContent = _sendBuffer.Dequeue();
                 if (currentPos + nextSendContent.Length > MTU)
                 {
+                    for (; iWaitAck < _waitAckList.Count; iWaitAck++)
+                    {
+                        if(Clock - _waitAckList[iWaitAck].LastSendTimestamp  < 0.001f)
+                        {
+                            continue;
+                        }
+                        nextSendContent = _waitAckList[iWaitAck].Content;
+                        if (currentPos + nextSendContent.Length > MTU)
+                        {
+                            break;
+                        }
+                        Array.Copy(nextSendContent, 0, SendStreamBuffer, currentPos, nextSendContent.Length);
+                        currentPos += nextSendContent.Length;
+                    }
+
                     Send(SendStreamBuffer, currentPos);
                     currentPos = PublicFrameHeaderLength;
                 }
@@ -170,6 +186,21 @@ namespace MobaNet
             }
             if(currentPos > PublicFrameHeaderLength)
             {
+                for(; iWaitAck < _waitAckList.Count; iWaitAck++)
+                {
+                    if (Clock - _waitAckList[iWaitAck].LastSendTimestamp < 0.001f)
+                    {
+                        continue;
+                    }
+                    byte[] nextSendContent = _waitAckList[iWaitAck].Content;
+                    if (currentPos + nextSendContent.Length > MTU)
+                    {
+                        break;
+                    }
+                    Array.Copy(nextSendContent, 0, SendStreamBuffer, currentPos, nextSendContent.Length);
+                    currentPos += nextSendContent.Length;
+                }
+                
                 Send(SendStreamBuffer, currentPos);
             }
         }
